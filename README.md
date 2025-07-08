@@ -3,15 +3,15 @@ This main purpose of this script is to find all unused layouts, scripts, fields,
 
 ![Screenshot of SQL results](assets/screenshot.png)
 
-#Installation
+# Installation
 Download Python files and run the main file. 
 It will ask for you to find an XML of your DDR file.
 
-#Known Issues
+# Known Issues
 * Filemaker chokes on many emoji, esp any more complex ones that use a Zero-Width Joiner (ZWJ). For example: 👨 + ZWJ + 👩 + ZWJ + 👧 = 👨‍👩‍👧 (family). Because of this I just convert all emoji to +
 * This is very much pre-beta
 
-#Definitions and Notes
+# Definitions and Notes
 * TOCs = Table Occurances in the relationship graph
 * I've never programmed in Python. This was mostly written by an AI. 🤷‍♂️
 * This is something I put together for my own use, but hopefully will help others.
@@ -19,7 +19,7 @@ It will ask for you to find an XML of your DDR file.
 * In some cases I was suspicious of the counts that python created, so some results show a XML count, in these cases Python does a straight up occurrence count of that item name, which may give some skewed results if (for example) you have fields with the same name (i.e. if three tables have a field called Count_s the XML count will be unrealistic.
 * Run in -debug mode to see more debug info. Debug mode will also export a cleaned up version of the XML file that fixes some known issues with Filemakers XML
 
-##Odd Choices I've made
+## Odd Choices I've made
 Because I wrote this for myself, I've coded in some things that might trip you up. Here's an incomplete list of them, so you're aware. Feel free to adopt any of these or ignore them or comment them out.
 * To allow me to make easy SQL calls and still rename my TOCs My database is structured so that every base table has it’s own table in the TOC graph, and then is duplicated and labeled other places.
 * Script test:
@@ -37,7 +37,7 @@ Because I wrote this for myself, I've coded in some things that might trip you u
 * Custom fields:
     * Nothing Special
 
-#How I use it (in case anyone cares)
+# How I use it (in case anyone cares)
 * Layouts
     * Create a layout folder called ToDelete
     * Create a folder within it called Delete <currentdate +6 months>
