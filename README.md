@@ -1,5 +1,8 @@
 # FileMaker-DDR-Checker
 This main purpose of this script is to find all unused layouts, scripts, fields, tables, and relationships. It will also detect broken ExecuteSQL statements. 
+
+![Screenshot of SQL results](assets/screenshot.png)
+
 #Installation
 Download Python files and run the main file. 
 It will ask for you to find an XML of your DDR file.
