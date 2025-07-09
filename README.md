@@ -17,7 +17,8 @@ It will ask for you to find an XML of your DDR file.
 * This is something I put together for my own use, but hopefully will help others.
 * Emoji’s remain problematic. Filemaker sometimes turns them into ??, I change that to * when parsing for various reasons I no longer remember
 * In some cases I was suspicious of the counts that python created, so some results show a XML count, in these cases Python does a straight up occurrence count of that item name, which may give some skewed results if (for example) you have fields with the same name (i.e. if three tables have a field called Count_s the XML count will be unrealistic.
-* Run in -debug mode to see more debug info. Debug mode will also export a cleaned up version of the XML file that fixes some known issues with Filemakers XML
+* -debug mode will leave up debug info in terminal
+* -cache mode will save the data that's being passed to the various checks, including the XML file that's updated with emoji's fixed and other similar issues.
 
 ## Odd Choices I've made
 Because I wrote this for myself, I've coded in some things that might trip you up. Here's an incomplete list of them, so you're aware. Feel free to adopt any of these or ignore them or comment them out.
