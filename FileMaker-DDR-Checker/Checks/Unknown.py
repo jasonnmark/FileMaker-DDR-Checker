@@ -131,15 +131,30 @@ def apply_styling(ws):
             # Apply standard font
             context_cell.font = Font(color="000000")
 
-def run_check(raw_xml):
+def run_check(raw_xml, catalogs=None):
     """
     Find all references to unknown/deleted items in the DDR.
     This includes unknown scripts, tables, fields, layouts, etc.
+    Now uses shared catalogs for consistency.
     """
     
-    # Track script and layout paths for "to delete" detection  
-    script_paths = {}
-    layout_paths = {}
+    # Use shared catalogs if provided (new style)
+    if catalogs:
+        known_scripts = set(catalogs['scripts'].keys())
+        known_layouts = set(catalogs['layouts'].keys())
+        known_tables = set(catalogs['tables'].keys())
+        known_fields = catalogs['fields_by_table']
+        known_custom_functions = set(catalogs['custom_functions'].keys())
+        known_value_lists = set(catalogs['value_lists'].keys())
+        known_relationships = set(catalogs['relationships'].keys())
+        table_occurrences_to_base = catalogs['table_occurrences']
+        script_paths = catalogs['script_paths']
+        layout_paths = catalogs['layout_paths']
+        root = catalogs['root']
+    else:
+        # If no catalogs provided, we can't run this check
+        print("Warning: Unknown References check requires shared catalogs")
+        return []
     
     def determine_status(location, error, calc_text=None, is_script_step=False, step_elem=None):
         """Determine the status of an unknown reference"""
@@ -212,126 +227,7 @@ def run_check(raw_xml):
         return False
     
     try:
-        # Parse the XML
-        parser = ET.XMLParser(remove_blank_text=True, recover=True)
-        root = ET.fromstring(raw_xml.encode('utf-8'), parser)
-        
         results = []
-        
-        # Build catalogs of known items
-        known_scripts = set()
-        known_layouts = set()
-        known_tables = set()
-        known_fields = defaultdict(set)
-        known_custom_functions = set()
-        known_value_lists = set()
-        known_relationships = set()
-        table_occurrences_to_base = {}
-        
-        # Build script catalog with paths
-        for script_catalog in root.findall(".//ScriptCatalog"):
-            def process_script_catalog(elem, current_path=""):
-                if elem.tag == "Group":
-                    group_name = elem.attrib.get("name", "")
-                    if group_name:
-                        new_path = f"{current_path} > {group_name}" if current_path else group_name
-                        for child in elem:
-                            process_script_catalog(child, new_path)
-                elif elem.tag == "Script":
-                    script_id = elem.attrib.get("id", "")
-                    script_name = elem.attrib.get("name", "")
-                    if script_id and script_name:
-                        script_paths[script_name] = current_path if current_path else "Top Level"
-                else:
-                    for child in elem:
-                        process_script_catalog(child, current_path)
-            
-            for child in script_catalog:
-                process_script_catalog(child)
-        
-        # Build layout catalog with paths
-        for layout_catalog in root.findall(".//LayoutCatalog"):
-            def process_layout_catalog(elem, current_path=""):
-                if elem.tag == "Group":
-                    group_name = elem.attrib.get("name", "")
-                    if group_name:
-                        new_path = f"{current_path} > {group_name}" if current_path else group_name
-                        for child in elem:
-                            process_layout_catalog(child, new_path)
-                elif elem.tag == "Layout":
-                    layout_id = elem.attrib.get("id", "")
-                    layout_name = elem.attrib.get("name", "")
-                    if layout_id and layout_name:
-                        layout_paths[layout_name] = current_path if current_path else "Top Level"
-                else:
-                    for child in elem:
-                        process_layout_catalog(child, current_path)
-            
-            for child in layout_catalog:
-                process_layout_catalog(child)
-        
-        # 1. Build catalog of known scripts
-        for script in root.findall(".//Script"):
-            script_name = script.attrib.get("name")
-            if script_name:
-                known_scripts.add(script_name)
-        
-        # 2. Build catalog of known layouts
-        for layout in root.findall(".//Layout"):
-            layout_name = layout.attrib.get("name")
-            if layout_name:
-                known_layouts.add(layout_name)
-        
-        # 3. Build catalog of known tables and fields
-        # Build table occurrence mapping first
-        for table_node in root.findall(".//Table"):
-            occurrence_name = table_node.attrib.get("name")
-            base_table_name = table_node.attrib.get("baseTable")
-            if occurrence_name and base_table_name:
-                table_occurrences_to_base[occurrence_name] = base_table_name
-        
-        for table_occ in root.findall(".//TableOccurrence"):
-            occ_name = table_occ.attrib.get("name")
-            base_table = table_occ.attrib.get("baseTable")
-            if occ_name and base_table:
-                table_occurrences_to_base[occ_name] = base_table
-        
-        # Build known tables
-        for table_node in root.findall(".//BaseTable"):
-            table_name = table_node.attrib.get("name")
-            if table_name:
-                known_tables.add(table_name)
-                for field_node in table_node.findall(".//Field"):
-                    field_name = field_node.attrib.get("name")
-                    if field_name:
-                        known_fields[table_name].add(field_name)
-        
-        # Also check FieldCatalog
-        for field_catalog in root.findall(".//FieldCatalog/Field"):
-            field_name = field_catalog.attrib.get("name")
-            table_name = field_catalog.attrib.get("table")
-            if field_name and table_name:
-                base_table = table_occurrences_to_base.get(table_name, table_name)
-                known_tables.add(base_table)
-                known_fields[base_table].add(field_name)
-        
-        # 4. Build catalog of known custom functions
-        for cf in root.findall(".//CustomFunction"):
-            cf_name = cf.attrib.get("name")
-            if cf_name:
-                known_custom_functions.add(cf_name)
-        
-        # 5. Build catalog of known value lists
-        for vl in root.findall(".//ValueList"):
-            vl_name = vl.attrib.get("name")
-            if vl_name:
-                known_value_lists.add(vl_name)
-        
-        # 6. Build catalog of known relationships
-        for rel in root.findall(".//Relationship"):
-            rel_name = rel.attrib.get("name")
-            if rel_name:
-                known_relationships.add(rel_name)
         
         # Now search for unknown references
         
@@ -342,6 +238,10 @@ def run_check(raw_xml):
             for step in script.findall(".//Step"):
                 step_name = step.attrib.get("name", "")
                 step_index = step.attrib.get("index", "")
+                step_id = step.attrib.get("id", "")
+                
+                # Use step index for display (this is the step number)
+                step_number = step_index if step_index else step_id
                 
                 # Check Perform Script steps
                 if step_name == "Perform Script":
@@ -351,7 +251,7 @@ def run_check(raw_xml):
                         ref_script_name = script_ref.attrib.get("name", "")
                         if ref_script_name and ref_script_name not in known_scripts:
                             xml_line = getattr(script_ref, 'sourceline', 'unknown')
-                            location = f'Step {step_index}: {step_name}'
+                            location = f'Step {step_number}: {step_name}'
                             error = f'Unknown script: "{ref_script_name}"'
                             status = determine_status(f'Script: {script_name}, {location}', error, is_script_step=True, step_elem=step)
                             
@@ -359,7 +259,7 @@ def run_check(raw_xml):
                                 "Status": status,
                                 "Type": "Script",
                                 "Context": script_name,
-                                "Location": f'Step {step_index}: {step_name}',
+                                "Location": location,
                                 "Commented": "Yes" if is_commented(status, is_script_step=True, step_elem=step) else "No",
                                 "Error": error,
                                 "XML Line": xml_line,
@@ -373,7 +273,7 @@ def run_check(raw_xml):
                         ref_layout_name = layout_ref.attrib.get("name", "")
                         if ref_layout_name and ref_layout_name not in known_layouts:
                             xml_line = getattr(layout_ref, 'sourceline', 'unknown')
-                            location = f'Step {step_index}: {step_name}'
+                            location = f'Step {step_number}: {step_name}'
                             error = f'Unknown layout: "{ref_layout_name}"'
                             status = determine_status(f'Script: {script_name}, {location}', error, is_script_step=True, step_elem=step)
                             
@@ -389,52 +289,55 @@ def run_check(raw_xml):
                             })
                 
                 # Check all Field references in any script step
-                for field_ref in step.findall(".//Field"):
-                    field_name = field_ref.attrib.get("name", "")
-                    table_name = field_ref.attrib.get("table", "")
-                    
-                    if field_name and table_name:
-                        # Get base table
-                        base_table = table_occurrences_to_base.get(table_name, table_name)
+                # Skip SQL-related steps since SQL errors are handled by a separate check
+                if step_name not in ["Execute SQL"]:
+                    for field_ref in step.findall(".//Field"):
+                        field_name = field_ref.attrib.get("name", "")
+                        table_name = field_ref.attrib.get("table", "")
                         
-                        # Check if table exists
-                        if base_table not in known_tables:
-                            xml_line = getattr(field_ref, 'sourceline', 'unknown')
-                            location = f'Step {step_index}: {step_name}'
-                            error = f'Unknown table: "{table_name}"'
-                            status = determine_status(f'Script: {script_name}, {location}', error, is_script_step=True, step_elem=step)
+                        if field_name and table_name:
+                            # Get base table
+                            base_table = table_occurrences_to_base.get(table_name, table_name)
                             
-                            results.append({
-                                "Status": status,
-                                "Type": "Script",
-                                "Context": script_name,
-                                "Location": location,
-                                "Commented": "Yes" if is_commented(status, is_script_step=True, step_elem=step) else "No",
-                                "Error": error,
-                                "XML Line": xml_line,
-                                "Details": "Table not found"
-                            })
-                        # Check if field exists in the table
-                        elif field_name not in known_fields.get(base_table, set()):
-                            xml_line = getattr(field_ref, 'sourceline', 'unknown')
-                            location = f'Step {step_index}: {step_name}'
-                            error = f'Unknown field: "{table_name}::{field_name}"'
-                            status = determine_status(f'Script: {script_name}, {location}', error, is_script_step=True, step_elem=step)
-                            
-                            results.append({
-                                "Status": status,
-                                "Type": "Script",
-                                "Context": script_name,
-                                "Location": location,
-                                "Commented": "Yes" if is_commented(status, is_script_step=True, step_elem=step) else "No",
-                                "Error": error,
-                                "XML Line": xml_line,
-                                "Details": "Field not found in table"
-                            })
+                            # Check if table exists
+                            if base_table not in known_tables:
+                                xml_line = getattr(field_ref, 'sourceline', 'unknown')
+                                location = f'Step {step_number}: {step_name}'
+                                error = f'Unknown table: "{table_name}"'
+                                status = determine_status(f'Script: {script_name}, {location}', error, is_script_step=True, step_elem=step)
+                                
+                                results.append({
+                                    "Status": status,
+                                    "Type": "Script",
+                                    "Context": script_name,
+                                    "Location": location,
+                                    "Commented": "Yes" if is_commented(status, is_script_step=True, step_elem=step) else "No",
+                                    "Error": error,
+                                    "XML Line": xml_line,
+                                    "Details": "Table not found"
+                                })
+                            # Check if field exists in the table
+                            elif field_name not in known_fields.get(base_table, set()):
+                                xml_line = getattr(field_ref, 'sourceline', 'unknown')
+                                location = f'Step {step_number}: {step_name}'
+                                error = f'Unknown field: "{table_name}::{field_name}"'
+                                status = determine_status(f'Script: {script_name}, {location}', error, is_script_step=True, step_elem=step)
+                                
+                                results.append({
+                                    "Status": status,
+                                    "Type": "Script",
+                                    "Context": script_name,
+                                    "Location": location,
+                                    "Commented": "Yes" if is_commented(status, is_script_step=True, step_elem=step) else "No",
+                                    "Error": error,
+                                    "XML Line": xml_line,
+                                    "Details": "Field not found in table"
+                                })
                 
                 # Check calculations in script steps (like Set Field, Set Variable, etc.)
+                # Skip ExecuteSQL calculations since SQL errors are handled separately
                 for calc in step.findall(".//Calculation"):
-                    if calc.text:
+                    if calc.text and "ExecuteSQL" not in calc.text:
                         # Look for table::field references
                         table_field_pattern = re.compile(r'([a-zA-Z0-9_🌎🧑‍🎓_🔗👥]+)::([a-zA-Z0-9_]+)')
                         matches = table_field_pattern.findall(calc.text)
@@ -444,7 +347,7 @@ def run_check(raw_xml):
                             
                             if base_table not in known_tables:
                                 xml_line = getattr(calc, 'sourceline', 'unknown')
-                                location = f'Step {step_index}: {step_name}'
+                                location = f'Step {step_number}: {step_name}'
                                 error = f'Unknown table in calculation: "{ref_table}"'
                                 status = determine_status(f'Script: {script_name}, {location}', error, is_script_step=True, step_elem=step)
                                 
@@ -460,7 +363,7 @@ def run_check(raw_xml):
                                 })
                             elif ref_field not in known_fields.get(base_table, set()):
                                 xml_line = getattr(calc, 'sourceline', 'unknown')
-                                location = f'Step {step_index}: {step_name}'
+                                location = f'Step {step_number}: {step_name}'
                                 error = f'Unknown field in calculation: "{ref_table}::{ref_field}"'
                                 status = determine_status(f'Script: {script_name}, {location}', error, is_script_step=True, step_elem=step)
                                 
@@ -641,45 +544,47 @@ def run_check(raw_xml):
                 # Check field calculation
                 calc = field_node.find(".//Calculation")
                 if calc is not None and calc.text:
-                    # Look for table::field references
-                    table_field_pattern = re.compile(r'([a-zA-Z0-9_🌎🧑‍🎓_🔗👥]+)::([a-zA-Z0-9_]+)')
-                    matches = table_field_pattern.findall(calc.text)
-                    
-                    for ref_table, ref_field in matches:
-                        base_table = table_occurrences_to_base.get(ref_table, ref_table)
+                    # Skip calculations with ExecuteSQL since SQL errors are handled separately
+                    if "ExecuteSQL" not in calc.text:
+                        # Look for table::field references
+                        table_field_pattern = re.compile(r'([a-zA-Z0-9_🌎🧑‍🎓_🔗👥]+)::([a-zA-Z0-9_]+)')
+                        matches = table_field_pattern.findall(calc.text)
                         
-                        if base_table not in known_tables:
-                            xml_line = getattr(calc, 'sourceline', 'unknown')
-                            location = f'Field: {field_name}'
-                            error = f'Unknown table in calculation: "{ref_table}"'
-                            status = determine_status(f'Field: {table_name}::{field_name}', error, calc_text=calc.text)
+                        for ref_table, ref_field in matches:
+                            base_table = table_occurrences_to_base.get(ref_table, ref_table)
                             
-                            results.append({
-                                "Status": status,
-                                "Type": "Field Calc",
-                                "Context": table_name,
-                                "Location": location,
-                                "Commented": "Yes" if is_commented(status, calc_text=calc.text) else "No",
-                                "Error": error,
-                                "XML Line": xml_line,
-                                "Details": "Table referenced in calculation not found"
-                            })
-                        elif ref_field not in known_fields.get(base_table, set()):
-                            xml_line = getattr(calc, 'sourceline', 'unknown')
-                            location = f'Field: {field_name}'
-                            error = f'Unknown field in calculation: "{ref_table}::{ref_field}"'
-                            status = determine_status(f'Field: {table_name}::{field_name}', error, calc_text=calc.text)
-                            
-                            results.append({
-                                "Status": status,
-                                "Type": "Field Calc",
-                                "Context": table_name,
-                                "Location": location,
-                                "Commented": "Yes" if is_commented(status, calc_text=calc.text) else "No",
-                                "Error": error,
-                                "XML Line": xml_line,
-                                "Details": "Field referenced in calculation not found"
-                            })
+                            if base_table not in known_tables:
+                                xml_line = getattr(calc, 'sourceline', 'unknown')
+                                location = f'Field: {field_name}'
+                                error = f'Unknown table in calculation: "{ref_table}"'
+                                status = determine_status(f'Field: {table_name}::{field_name}', error, calc_text=calc.text)
+                                
+                                results.append({
+                                    "Status": status,
+                                    "Type": "Field Calc",
+                                    "Context": table_name,
+                                    "Location": location,
+                                    "Commented": "Yes" if is_commented(status, calc_text=calc.text) else "No",
+                                    "Error": error,
+                                    "XML Line": xml_line,
+                                    "Details": "Table referenced in calculation not found"
+                                })
+                            elif ref_field not in known_fields.get(base_table, set()):
+                                xml_line = getattr(calc, 'sourceline', 'unknown')
+                                location = f'Field: {field_name}'
+                                error = f'Unknown field in calculation: "{ref_table}::{ref_field}"'
+                                status = determine_status(f'Field: {table_name}::{field_name}', error, calc_text=calc.text)
+                                
+                                results.append({
+                                    "Status": status,
+                                    "Type": "Field Calc",
+                                    "Context": table_name,
+                                    "Location": location,
+                                    "Commented": "Yes" if is_commented(status, calc_text=calc.text) else "No",
+                                    "Error": error,
+                                    "XML Line": xml_line,
+                                    "Details": "Field referenced in calculation not found"
+                                })
         
         # Check custom functions for unknown references
         for cf_node in root.findall(".//CustomFunction"):

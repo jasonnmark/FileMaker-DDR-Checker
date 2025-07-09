@@ -3,6 +3,13 @@ import subprocess
 import platform
 import os
 import json
+import pickle
+import hashlib
+
+# Suppress macOS Tkinter warnings
+if platform.system() == "Darwin":
+    os.environ['TK_SILENCE_DEPRECATION'] = '1'
+
 from tkinter import Tk
 from tkinter.filedialog import askopenfilename
 from collections import defaultdict
@@ -11,7 +18,6 @@ from lxml import etree as ET
 from openpyxl.styles import Font, PatternFill, Alignment
 import pandas as pd
 import importlib.util
-import pickle
 
 # Check for debug mode and cache mode early
 DEBUG_MODE = '-debug' in sys.argv or '--debug' in sys.argv
@@ -51,49 +57,101 @@ def get_exports_dir():
         os.makedirs(exports_dir)
     return exports_dir
 
-def get_cache_filename():
-    """Get the single cache filename"""
-    return "ddr_normalized.cache"
+def get_file_hash(file_path):
+    """Get a hash of the file content for cache validation"""
+    hasher = hashlib.md5()
+    with open(file_path, 'rb') as f:
+        # Read in chunks to handle large files
+        for chunk in iter(lambda: f.read(4096), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
-def save_to_cache(normalized_xml, input_file, base_output_name):
-    """Save normalized XML to cache"""
-    cache_dir = get_cache_dir()
-    cache_file = os.path.join(cache_dir, get_cache_filename())
+def get_cache_filename(xml_file):
+    """Get the cache filename for a given XML file"""
+    file_hash = get_file_hash(xml_file)
+    base_name = os.path.splitext(os.path.basename(xml_file))[0]
+    return f"{base_name}_{file_hash}.cache"
+
+def get_last_used_file():
+    """Get the last used file from cache directory"""
+    if not CACHE_MODE:
+        return None
     
-    # Save both the normalized XML and metadata
-    cache_data = {
-        'normalized_xml': normalized_xml,
-        'input_file': input_file,
-        'base_output_name': base_output_name,
-        'file_modified_time': os.path.getmtime(input_file)
-    }
+    cache_dir = get_cache_dir()
+    last_file_path = os.path.join(cache_dir, ".last_used_file")
+    
+    if os.path.exists(last_file_path):
+        try:
+            with open(last_file_path, 'r') as f:
+                last_file = f.read().strip()
+                if os.path.exists(last_file):
+                    return last_file
+        except:
+            pass
+    
+    return None
+
+def save_last_used_file(file_path):
+    """Save the last used file path"""
+    if not CACHE_MODE:
+        return
+    
+    cache_dir = get_cache_dir()
+    last_file_path = os.path.join(cache_dir, ".last_used_file")
     
     try:
+        with open(last_file_path, 'w') as f:
+            f.write(file_path)
+    except:
+        pass
+
+def save_to_cache(xml_file, normalized_xml, catalogs):
+    """Save normalized XML and catalogs to cache file"""
+    if not CACHE_MODE:
+        return
+    
+    cache_dir = get_cache_dir()
+    cache_file = os.path.join(cache_dir, get_cache_filename(xml_file))
+    
+    try:
+        # Cache both the normalized XML and the catalogs
+        # We'll parse the root from XML when loading to save space
+        cache_data = {
+            'normalized_xml': normalized_xml,
+            'catalogs': {k: v for k, v in catalogs.items() if k not in ['raw_xml', 'root']}
+        }
+        
         with open(cache_file, 'wb') as f:
             pickle.dump(cache_data, f)
-        print(f"✓ Cached normalized data")
-        return True
+        
+        print(f"✓ Saved normalized XML and catalogs to cache: {os.path.basename(cache_file)}")
     except Exception as e:
         print(f"Warning: Could not save cache: {e}")
-        return False
 
-def load_from_cache():
-    """Load normalized XML from cache if it exists"""
+def load_from_cache(xml_file):
+    """Load normalized XML and catalogs from cache file if it exists and is valid"""
+    if not CACHE_MODE:
+        return None, None
+    
     cache_dir = get_cache_dir()
-    cache_file = os.path.join(cache_dir, get_cache_filename())
+    cache_file = os.path.join(cache_dir, get_cache_filename(xml_file))
     
-    if not os.path.exists(cache_file):
-        return None
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, 'rb') as f:
+                cache_data = pickle.load(f)
+            
+            print(f"✓ Loaded data from cache: {os.path.basename(cache_file)}")
+            return cache_data.get('normalized_xml'), cache_data.get('catalogs')
+        except Exception as e:
+            print(f"Warning: Could not load cache: {e}")
+            # Delete corrupted cache file
+            try:
+                os.remove(cache_file)
+            except:
+                pass
     
-    try:
-        with open(cache_file, 'rb') as f:
-            cache_data = pickle.load(f)
-        
-        print(f"✓ Found cache")
-        return cache_data
-    except Exception as e:
-        print(f"✗ Could not load cache: {e}")
-        return None
+    return None, None
 
 def get_color_fill(color_name):
     """Get a PatternFill object for a standard color"""
@@ -268,6 +326,224 @@ def replace_emojis_with_plus(text):
     
     return final_text
 
+def build_ddr_catalogs(root, raw_xml):
+    """
+    Build comprehensive catalogs of all DDR entities.
+    This is done once and shared with all check modules.
+    """
+    catalogs = {
+        'scripts': {},           # script_name -> {'id': id, 'path': folder_path}
+        'layouts': {},           # layout_name -> {'id': id, 'path': folder_path}
+        'tables': {},            # base_table_name -> {'id': id, 'fields': {field_name -> field_info}}
+        'table_occurrences': {}, # occurrence_name -> base_table_name
+        'custom_functions': {},  # cf_name -> {'id': id}
+        'value_lists': {},       # vl_name -> {'id': id}
+        'relationships': {},     # rel_name -> {'id': id, 'left_table': ..., 'right_table': ...}
+        'fields_by_table': defaultdict(dict),  # table_name -> {field_name -> field_info}
+        'script_paths': {},      # script_name -> folder_path
+        'layout_paths': {},      # layout_name -> folder_path
+        'raw_xml': raw_xml,      # Include raw XML for checks that need it
+        'root': root            # Include parsed root for checks that need it
+    }
+    
+    print("  Building table occurrences catalog...")
+    # 1. Build table occurrence mapping first
+    for table_node in root.findall(".//Table"):
+        occurrence_name = table_node.attrib.get("name")
+        base_table_name = table_node.attrib.get("baseTable")
+        if occurrence_name and base_table_name:
+            catalogs['table_occurrences'][occurrence_name] = base_table_name
+    
+    for table_occ in root.findall(".//TableOccurrence"):
+        occ_name = table_occ.attrib.get("name")
+        base_table = table_occ.attrib.get("baseTable")
+        if occ_name and base_table:
+            catalogs['table_occurrences'][occ_name] = base_table
+    
+    # Also check in RelationshipGraph
+    for table_occurrence in root.findall(".//RelationshipGraph//TableOccurrence"):
+        name = table_occurrence.attrib.get("name")
+        base_table = table_occurrence.attrib.get("baseTable")
+        if name and base_table:
+            catalogs['table_occurrences'][name] = base_table
+    
+    print("  Building tables and fields catalog...")
+    # 2. Build table and field catalogs
+    # Method 1: BaseTable nodes
+    for table_node in root.findall(".//BaseTable"):
+        table_name = table_node.attrib.get("name")
+        if table_name:
+            table_info = {
+                'id': table_node.attrib.get("id", ""),
+                'fields': {}
+            }
+            
+            for field_node in table_node.findall(".//Field"):
+                field_name = field_node.attrib.get("name")
+                if field_name:
+                    field_info = {
+                        'name': field_name,
+                        'id': field_node.attrib.get("id", ""),
+                        'type': field_node.attrib.get("dataType", "")
+                    }
+                    table_info['fields'][field_name] = field_info
+                    catalogs['fields_by_table'][table_name][field_name] = field_info
+            
+            catalogs['tables'][table_name] = table_info
+    
+    # Method 2: FieldCatalog nodes
+    for field_catalog in root.findall(".//FieldCatalog/Field"):
+        field_name = field_catalog.attrib.get("name")
+        table_name = field_catalog.attrib.get("table")
+        if field_name and table_name:
+            # Get the base table if it's a table occurrence
+            base_table = catalogs['table_occurrences'].get(table_name, table_name)
+            
+            field_info = {
+                'name': field_name,
+                'id': field_catalog.attrib.get("id", ""),
+                'type': field_catalog.attrib.get("dataType", "")
+            }
+            
+            # Ensure table exists in catalog
+            if base_table not in catalogs['tables']:
+                catalogs['tables'][base_table] = {'id': '', 'fields': {}}
+            
+            catalogs['tables'][base_table]['fields'][field_name] = field_info
+            catalogs['fields_by_table'][base_table][field_name] = field_info
+    
+    # Method 3: BaseTableCatalog nodes
+    for base_table_catalog in root.findall(".//BaseTableCatalog"):
+        for table_entry in base_table_catalog.findall(".//BaseTable"):
+            table_name = table_entry.attrib.get("name")
+            if table_name:
+                if table_name not in catalogs['tables']:
+                    catalogs['tables'][table_name] = {'id': table_entry.attrib.get("id", ""), 'fields': {}}
+                
+                for fc in table_entry.findall(".//FieldCatalog/Field"):
+                    field_name = fc.attrib.get("name")
+                    if field_name:
+                        field_info = {
+                            'name': field_name,
+                            'id': fc.attrib.get("id", ""),
+                            'type': fc.attrib.get("dataType", "")
+                        }
+                        catalogs['tables'][table_name]['fields'][field_name] = field_info
+                        catalogs['fields_by_table'][table_name][field_name] = field_info
+    
+    print("  Building scripts catalog...")
+    # 3. Build script catalog with paths
+    for script_catalog in root.findall(".//ScriptCatalog"):
+        def process_script_catalog(elem, current_path=""):
+            if elem.tag == "Group":
+                group_name = elem.attrib.get("name", "")
+                if group_name:
+                    new_path = f"{current_path} > {group_name}" if current_path else group_name
+                    for child in elem:
+                        process_script_catalog(child, new_path)
+            elif elem.tag == "Script":
+                script_id = elem.attrib.get("id", "")
+                script_name = elem.attrib.get("name", "")
+                if script_id and script_name:
+                    catalogs['scripts'][script_name] = {
+                        'id': script_id,
+                        'path': current_path if current_path else "Top Level"
+                    }
+                    catalogs['script_paths'][script_name] = current_path if current_path else "Top Level"
+            else:
+                for child in elem:
+                    process_script_catalog(child, current_path)
+        
+        for child in script_catalog:
+            process_script_catalog(child)
+    
+    # Also add scripts found elsewhere
+    for script in root.findall(".//Script"):
+        script_name = script.attrib.get("name")
+        script_id = script.attrib.get("id", "")
+        if script_name and script_name not in catalogs['scripts']:
+            catalogs['scripts'][script_name] = {
+                'id': script_id,
+                'path': "Unknown"
+            }
+    
+    print("  Building layouts catalog...")
+    # 4. Build layout catalog with paths
+    for layout_catalog in root.findall(".//LayoutCatalog"):
+        def process_layout_catalog(elem, current_path=""):
+            if elem.tag == "Group":
+                group_name = elem.attrib.get("name", "")
+                if group_name:
+                    new_path = f"{current_path} > {group_name}" if current_path else group_name
+                    for child in elem:
+                        process_layout_catalog(child, new_path)
+            elif elem.tag == "Layout":
+                layout_id = elem.attrib.get("id", "")
+                layout_name = elem.attrib.get("name", "")
+                if layout_id and layout_name:
+                    catalogs['layouts'][layout_name] = {
+                        'id': layout_id,
+                        'path': current_path if current_path else "Top Level"
+                    }
+                    catalogs['layout_paths'][layout_name] = current_path if current_path else "Top Level"
+            else:
+                for child in elem:
+                    process_layout_catalog(child, current_path)
+        
+        for child in layout_catalog:
+            process_layout_catalog(child)
+    
+    # Also add layouts found elsewhere
+    for layout in root.findall(".//Layout"):
+        layout_name = layout.attrib.get("name")
+        layout_id = layout.attrib.get("id", "")
+        if layout_name and layout_name not in catalogs['layouts']:
+            catalogs['layouts'][layout_name] = {
+                'id': layout_id,
+                'path': "Unknown"
+            }
+    
+    print("  Building other catalogs...")
+    # 5. Build custom function catalog
+    for cf in root.findall(".//CustomFunction"):
+        cf_name = cf.attrib.get("name")
+        cf_id = cf.attrib.get("id", "")
+        if cf_name:
+            catalogs['custom_functions'][cf_name] = {'id': cf_id}
+    
+    # 6. Build value list catalog
+    for vl in root.findall(".//ValueList"):
+        vl_name = vl.attrib.get("name")
+        vl_id = vl.attrib.get("id", "")
+        if vl_name:
+            catalogs['value_lists'][vl_name] = {'id': vl_id}
+    
+    # 7. Build relationship catalog
+    for rel in root.findall(".//Relationship"):
+        rel_name = rel.attrib.get("name")
+        rel_id = rel.attrib.get("id", "")
+        if rel_name:
+            # Try to get left and right tables
+            left_table = None
+            right_table = None
+            
+            left_table_elem = rel.find(".//LeftTable")
+            if left_table_elem is not None:
+                left_table = left_table_elem.attrib.get("name")
+            
+            right_table_elem = rel.find(".//RightTable")
+            if right_table_elem is not None:
+                right_table = right_table_elem.attrib.get("name")
+            
+            catalogs['relationships'][rel_name] = {
+                'id': rel_id,
+                'left_table': left_table,
+                'right_table': right_table
+            }
+    
+    print("  Catalog building complete!")
+    return catalogs
+
 def load_check_module(module_name, file_path):
     """Dynamically load a check module from file path"""
     try:
@@ -285,24 +561,195 @@ def load_check_module(module_name, file_path):
         print(f"Error loading check module {module_name}: {e}")
         return None
 
-def normalize_xml(raw_xml):
-    """Normalize XML content - extracted from parse_ddr for reuse"""
+def parse_ddr(xml_file, base_output_name):
+    try:
+        # Check if we can use cached data
+        cached_xml, cached_catalogs = load_from_cache(xml_file)
+        
+        if cached_xml and cached_catalogs:
+            # We have cached data - use it directly!
+            print("\nUsing cached normalized XML and catalogs...")
+            raw_xml = cached_xml
+            
+            # Parse the root from cached XML
+            parser = ET.XMLParser(remove_blank_text=True, recover=True)
+            root = ET.fromstring(raw_xml.encode('utf-8'), parser)
+            
+            # Use cached catalogs and add raw_xml and root back
+            catalogs = cached_catalogs
+            catalogs['raw_xml'] = raw_xml
+            catalogs['root'] = root
+        else:
+            # No cache or cache mode not enabled, process normally
+            print("\nProcessing DDR XML...")
+            
+            # Read and normalize XML
+            raw_xml, root = read_and_normalize_xml(xml_file)
+            
+            # Build comprehensive catalogs once
+            print("\nBuilding DDR catalogs...")
+            catalogs = build_ddr_catalogs(root, raw_xml)
+            
+            # Save to cache if cache mode is enabled
+            save_to_cache(xml_file, raw_xml, catalogs)
+        
+        # Print catalog summary
+        print(f"\n✓ Found {len(catalogs['scripts'])} scripts")
+        print(f"✓ Found {len(catalogs['layouts'])} layouts")
+        print(f"✓ Found {len(catalogs['tables'])} tables")
+        print(f"✓ Found {len(catalogs['table_occurrences'])} table occurrences")
+        print(f"✓ Found {len(catalogs['custom_functions'])} custom functions")
+        print(f"✓ Found {len(catalogs['value_lists'])} value lists")
+        print(f"✓ Found {len(catalogs['relationships'])} relationships")
+        
+        total_fields = sum(len(table_info.get('fields', {})) for table_info in catalogs['tables'].values())
+        print(f"✓ Found {total_fields} fields across all tables")
+
+        # Load and run all checks from Checks folder
+        all_sheets = {}
+        sheet_orders = {}  # Track sheet orders
+        checks_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Checks")
+        
+        if os.path.exists(checks_dir):
+            print("\nRunning checks...")
+            # First, collect all check modules
+            check_modules = []
+            
+            # Scan for all .py files in Checks folder
+            for filename in sorted(os.listdir(checks_dir)):
+                if filename.endswith('.py') and not filename.startswith('__'):
+                    check_path = os.path.join(checks_dir, filename)
+                    module_name = filename[:-3]  # Remove .py extension
+                    
+                    check_module = load_check_module(module_name, check_path)
+                    if check_module and hasattr(check_module, 'run_check'):
+                        # Get sheet order if defined
+                        sheet_order = None
+                        if hasattr(check_module, 'get_sheet_order'):
+                            try:
+                                sheet_order = check_module.get_sheet_order()
+                            except:
+                                sheet_order = None
+                        
+                        check_modules.append({
+                            'module': check_module,
+                            'name': module_name,
+                            'path': check_path,
+                            'order': float(sheet_order) if sheet_order is not None else float('inf')
+                        })
+            
+            # Sort modules by order, then by name
+            check_modules.sort(key=lambda x: (x['order'], x['name']))
+            
+            # Run checks in sorted order
+            total_results = 0
+            for check_info in check_modules:
+                check_module = check_info['module']
+                module_name = check_info['name']
+                
+                print(f"Running {module_name}...")
+                
+                try:
+                    # Check if the module expects the new catalogs parameter
+                    import inspect
+                    sig = inspect.signature(check_module.run_check)
+                    
+                    if len(sig.parameters) >= 2:
+                        # New style - pass catalogs
+                        check_results = check_module.run_check(raw_xml, catalogs)
+                    else:
+                        # Old style - just pass raw_xml for backward compatibility
+                        check_results = check_module.run_check(raw_xml)
+                    
+                    if check_results and hasattr(check_module, 'get_sheet_name'):
+                        sheet_name = check_module.get_sheet_name()
+                    else:
+                        # Default sheet name based on module name
+                        sheet_name = module_name.replace('_', ' ').replace('Check', '').strip()
+                    
+                    if check_results:
+                        all_sheets[sheet_name] = {
+                            'data': check_results,
+                            'module': check_module
+                        }
+                        sheet_orders[sheet_name] = check_info['order']
+                        total_results += len(check_results)
+                        print(f"✓ {module_name} completed with {len(check_results)} results")
+                    else:
+                        print(f"  {module_name} returned no results")
+                except Exception as e:
+                    print(f"Error running {module_name}: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Clear terminal before final output if not in debug mode
+            if DEBUG_MODE:
+                print("\n[DEBUG] Skipping terminal clear due to debug mode")
+                print("=== FileMaker DDR Analysis Complete (Debug Mode) ===")
+                print(f"Total issues found: {total_results}")
+                print("Debug mode: All output preserved above")
+                print()
+            else:
+                os.system('cls' if os.name == 'nt' else 'clear')
+                print("=== FileMaker DDR Analysis Complete ===")
+                print(f"Total issues found: {total_results}")
+                if CACHE_MODE:
+                    print("Cache mode: Enabled")
+                print()
+            
+            # Generate output with all sheets
+            if all_sheets:
+                generate_output_files(all_sheets, base_output_name, total_results, sheet_orders)
+            else:
+                print("\nNo results found from any checks.")
+        else:
+            print(f"\nChecks folder not found at: {checks_dir}")
+            print("Please create a 'Checks' folder and add check modules.")
+
+    except ET.ParseError as e:
+        print(f"Error parsing XML: {e}")
+    except FileNotFoundError:
+        print(f"File not found: {xml_file}")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+
+def read_and_normalize_xml(xml_file):
+    """Read and normalize the XML file, return raw_xml and parsed root"""
+    # --- Read & normalize XML with better encoding handling ---
+    encodings_to_try = ['utf-8', 'utf-8-sig', 'utf-16', 'utf-16le', 'utf-16be']
+    # Detect BOM-based UTF-16 and read accordingly
+    with open(xml_file, 'rb') as __f:
+        __bom = __f.read(2)
+    if __bom in (b'\xff\xfe', b'\xfe\xff'):
+        # File is UTF-16, read in one shot and skip further encoding tries
+        with open(xml_file, 'r', encoding='utf-16', errors='replace') as __f:
+            raw_xml = __f.read()
+        print("Successfully read file with utf-16 BOM detection")
+    else:
+        raw_xml = None
+
+    if raw_xml is None:
+        for encoding in encodings_to_try:
+            try:
+                with open(xml_file, 'r', encoding=encoding, errors='replace') as f:
+                    raw_xml = f.read()
+                print(f"Successfully read file with {encoding} encoding")
+                break
+            except UnicodeDecodeError:
+                continue
+    
+    if raw_xml is None:
+        print(f"❌ Failed to read '{xml_file}' with any of the tried encodings.")
+        sys.exit(1)
+
     # Replace all emojis with + BEFORE any other processing
     raw_xml = replace_emojis_with_plus(raw_xml)
     
     count_nwea  = raw_xml.count("??")
     print(f'Found {count_nwea} occurrences of "??" in raw_xml')
 
-    # Replace all double question marks (was "🤯."), this is because Filemaker DDR doesn't always export emoji's correctly and it causes parsing problems.
-    # Now this should be redundant since we're replacing all emojis, but keeping for backwards compatibility
+    # Replace all double question marks
     raw_xml = raw_xml.replace("??", "+")
-    
-    # Check if the problematic pattern exists BEFORE any modifications
-    if DEBUG_MODE:
-        if "</DisplayCalculation>UpdateSingleStudentOnServer" in raw_xml:
-            print("[DEBUG] Found </DisplayCalculation>UpdateSingleStudentOnServer BEFORE normalization")
-        else:
-            print("[DEBUG] Did NOT find </DisplayCalculation>UpdateSingleStudentOnServer BEFORE normalization")
     
     # Replace smart quotes with regular quotes to normalize script references
     # Using Unicode escapes to avoid encoding issues
@@ -318,18 +765,6 @@ def normalize_xml(raw_xml):
     raw_xml = raw_xml.replace('"/>', '" />')
     raw_xml = raw_xml.replace("'/>", "' />")
     
-    # Debug: Check if the problematic pattern exists
-    if DEBUG_MODE:
-        import re
-        problem_pattern = re.findall(r'</DisplayCalculation>[A-Za-z]+', raw_xml)
-        if problem_pattern:
-            print(f"[DEBUG] Found {len(problem_pattern)} instances of content directly after </DisplayCalculation>")
-            for pattern in problem_pattern[:3]:
-                print(f"[DEBUG]   Example: {pattern}")
-    
-    # Note: Not fixing the </DisplayCalculation>ScriptName pattern
-    # This unusual XML structure needs to be preserved for accurate counting
-    
     # Also add space after semicolons in quotes for better parsing
     raw_xml = raw_xml.replace('";', '" ;')
     raw_xml = raw_xml.replace("';", "' ;")
@@ -337,163 +772,11 @@ def normalize_xml(raw_xml):
     count_plus = raw_xml.count("+")
     print(f"raw contains '+': {count_plus}")
     
-    return raw_xml
-
-def run_checks(raw_xml, base_output_name):
-    """Run all checks - extracted from parse_ddr for reuse"""
-    # Load and run all checks from Checks folder
-    all_sheets = {}
-    sheet_orders = {}  # Track sheet orders
-    checks_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Checks")
+    # Parse the XML once
+    parser = ET.XMLParser(remove_blank_text=True, recover=True)
+    root = ET.fromstring(raw_xml.encode('utf-8'), parser)
     
-    if os.path.exists(checks_dir):
-        print("\nRunning checks...")
-        # First, collect all check modules
-        check_modules = []
-        
-        # Scan for all .py files in Checks folder
-        for filename in sorted(os.listdir(checks_dir)):
-            if filename.endswith('.py') and not filename.startswith('__'):
-                check_path = os.path.join(checks_dir, filename)
-                module_name = filename[:-3]  # Remove .py extension
-                
-                check_module = load_check_module(module_name, check_path)
-                if check_module and hasattr(check_module, 'run_check'):
-                    # Get sheet order if defined
-                    sheet_order = None
-                    if hasattr(check_module, 'get_sheet_order'):
-                        try:
-                            sheet_order = check_module.get_sheet_order()
-                        except:
-                            sheet_order = None
-                    
-                    check_modules.append({
-                        'module': check_module,
-                        'name': module_name,
-                        'path': check_path,
-                        'order': float(sheet_order) if sheet_order is not None else float('inf')
-                    })
-        
-        # Sort modules by order, then by name
-        check_modules.sort(key=lambda x: (x['order'], x['name']))
-        
-        # Run checks in sorted order
-        total_results = 0
-        for check_info in check_modules:
-            check_module = check_info['module']
-            module_name = check_info['name']
-            
-            print(f"Running {module_name}...")
-            
-            try:
-                # Pass raw_xml to the check (with normalized quotes)
-                check_results = check_module.run_check(raw_xml)
-                if check_results and hasattr(check_module, 'get_sheet_name'):
-                    sheet_name = check_module.get_sheet_name()
-                else:
-                    # Default sheet name based on module name
-                    sheet_name = module_name.replace('_', ' ').replace('Check', '').strip()
-                
-                if check_results:
-                    all_sheets[sheet_name] = {
-                        'data': check_results,
-                        'module': check_module
-                    }
-                    sheet_orders[sheet_name] = check_info['order']
-                    total_results += len(check_results)
-                    print(f"✓ {module_name} completed with {len(check_results)} results")
-                else:
-                    print(f"  {module_name} returned no results")
-            except Exception as e:
-                print(f"Error running {module_name}: {e}")
-                import traceback
-                traceback.print_exc()
-        
-        # Clear terminal before final output if not in debug mode
-        if DEBUG_MODE:
-            print("\n[DEBUG] Skipping terminal clear due to debug mode")
-            print("=== FileMaker DDR Analysis Complete (Debug Mode) ===")
-            print(f"Total issues found: {total_results}")
-            print("Debug mode: All output preserved above")
-            print()
-        else:
-            os.system('cls' if os.name == 'nt' else 'clear')
-            print("=== FileMaker DDR Analysis Complete ===")
-            print(f"Total issues found: {total_results}")
-            print()
-        
-        # Generate output with all sheets
-        if all_sheets:
-            generate_output_files(all_sheets, base_output_name, total_results, sheet_orders)
-        else:
-            print("\nNo results found from any checks.")
-    else:
-        print(f"\nChecks folder not found at: {checks_dir}")
-        print("Please create a 'Checks' folder and add check modules.")
-
-def parse_ddr(xml_file, base_output_name):
-    try:
-        # Check if we should use cache
-        cache_data = None
-        if CACHE_MODE:
-            cache_data = load_from_cache()
-            # Verify it's for the same file
-            if cache_data and cache_data.get('input_file') != xml_file:
-                print("✗ Cache is for a different file, ignoring cache")
-                cache_data = None
-            elif cache_data and os.path.exists(xml_file):
-                # Check if the file has been modified since caching
-                if os.path.getmtime(xml_file) != cache_data.get('file_modified_time'):
-                    print("✗ Cache invalid: source file has been modified")
-                    cache_data = None
-        
-        if cache_data:
-            # Use cached data
-            raw_xml = cache_data['normalized_xml']
-            print("✓ Using cached normalized XML")
-        else:
-            # --- Read & normalize XML with better encoding handling ---
-            encodings_to_try = ['utf-8', 'utf-8-sig', 'utf-16', 'utf-16le', 'utf-16be']
-            # Detect BOM-based UTF-16 and read accordingly
-            with open(xml_file, 'rb') as __f:
-                __bom = __f.read(2)
-            if __bom in (b'\xff\xfe', b'\xfe\xff'):
-                # File is UTF-16, read in one shot and skip further encoding tries
-                with open(xml_file, 'r', encoding='utf-16', errors='replace') as __f:
-                    raw_xml = __f.read()
-                print("Successfully read file with utf-16 BOM detection")
-            else:
-                raw_xml = None
-
-            if raw_xml is None:
-                for encoding in encodings_to_try:
-                    try:
-                        with open(xml_file, 'r', encoding=encoding, errors='replace') as f:
-                            raw_xml = f.read()
-                        print(f"Successfully read file with {encoding} encoding")
-                        break
-                    except UnicodeDecodeError:
-                        continue
-            
-            if raw_xml is None:
-                print(f"❌ Failed to read '{xml_file}' with any of the tried encodings.")
-                sys.exit(1)
-
-            # Normalize the XML
-            raw_xml = normalize_xml(raw_xml)
-            
-            # Save to cache for future runs
-            save_to_cache(raw_xml, xml_file, base_output_name)
-
-        # Run checks
-        run_checks(raw_xml, base_output_name)
-
-    except ET.ParseError as e:
-        print(f"Error parsing XML: {e}")
-    except FileNotFoundError:
-        print(f"File not found: {xml_file}")
-    except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+    return raw_xml, root
 
 def generate_output_files(all_sheets, base_output_name, total_found, sheet_orders=None):
     """Write results to Excel with formatting."""
@@ -631,7 +914,6 @@ def generate_output_files(all_sheets, base_output_name, total_found, sheet_order
     auto_open_file(output_path)
 
     print(f"Full report saved to: {os.path.abspath(output_path)}")
-    
     print(f"\nRun complete: {total_found} results found.")
 
 def auto_open_file(filename):
@@ -652,43 +934,52 @@ def auto_open_file(filename):
 
 def get_input_file():
     """Handle file selection"""
-    # If cache mode, try to use cached data
+    # Check if we have a cached file to reuse
     if CACHE_MODE:
-        cache_data = load_from_cache()
-        if cache_data:
-            input_file = cache_data.get('input_file')
-            # Check if original file still exists
-            if input_file and os.path.exists(input_file):
-                print(f"Using cached data for: {os.path.basename(input_file)}")
-                return input_file
-            else:
-                print("✗ Original file from cache not found")
-                print("Please select the DDR file to process")
+        last_file = get_last_used_file()
+        if last_file:
+            print(f"\nLast used file: {os.path.basename(last_file)}")
+            response = input("Use this file again? (Y/n): ").lower().strip()
+            if response in ['', 'y', 'yes']:
+                return last_file
     
-    # Show file picker
-    Tk().withdraw()
+    # Create Tk root and bring it to front
+    root = Tk()
+    root.withdraw()
+    
+    # Bring the dialog to front on all platforms
+    root.lift()
+    root.attributes('-topmost', True)
+    root.focus_force()
+    
+    # Show the file dialog
     input_file = askopenfilename(
         title="Select DDR XML File",
-        filetypes=[("XML Files", "*.xml")]
+        filetypes=[("XML Files", "*.xml")],
+        parent=root
     )
+    
+    # Immediately destroy the root window to prevent "tk" window from lingering
+    root.quit()
+    root.destroy()
     
     if not input_file:
         print("No file selected. Exiting.")
         sys.exit(0)
     
+    # Save this as the last used file if in cache mode
+    if CACHE_MODE:
+        save_last_used_file(input_file)
+    
     return input_file
 
 if __name__ == "__main__":
-    # Display mode information
-    if CACHE_MODE:
-        print("Cache mode enabled - will use cached data if available")
-    if DEBUG_MODE:
-        print("Debug mode enabled - additional output will be shown")
-    
     # Get input file
     input_file = get_input_file()
     
     print(f"\nProcessing: {os.path.basename(input_file)}")
+    if CACHE_MODE:
+        print("Cache mode: Enabled - will use cached catalogs if available")
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     input_filename = os.path.splitext(os.path.basename(input_file))[0]
