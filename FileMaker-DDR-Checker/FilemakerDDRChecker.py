@@ -11,9 +11,11 @@ from lxml import etree as ET
 from openpyxl.styles import Font, PatternFill, Alignment
 import pandas as pd
 import importlib.util
+import pickle
 
-# Check for debug mode early
+# Check for debug mode and cache mode early
 DEBUG_MODE = '-debug' in sys.argv or '--debug' in sys.argv
+CACHE_MODE = '-cache' in sys.argv or '--cache' in sys.argv
 
 # Define standard colors and styles that check modules can use
 STANDARD_COLORS = {
@@ -49,29 +51,49 @@ def get_exports_dir():
         os.makedirs(exports_dir)
     return exports_dir
 
-def load_preferences():
-    """Load preferences from cache"""
-    cache_dir = get_cache_dir()
-    prefs_file = os.path.join(cache_dir, "preferences.json")
-    
-    if os.path.exists(prefs_file):
-        try:
-            with open(prefs_file, 'r') as f:
-                return json.load(f)
-        except:
-            return {}
-    return {}
+def get_cache_filename():
+    """Get the single cache filename"""
+    return "ddr_normalized.cache"
 
-def save_preferences(prefs):
-    """Save preferences to cache"""
+def save_to_cache(normalized_xml, input_file, base_output_name):
+    """Save normalized XML to cache"""
     cache_dir = get_cache_dir()
-    prefs_file = os.path.join(cache_dir, "preferences.json")
+    cache_file = os.path.join(cache_dir, get_cache_filename())
+    
+    # Save both the normalized XML and metadata
+    cache_data = {
+        'normalized_xml': normalized_xml,
+        'input_file': input_file,
+        'base_output_name': base_output_name,
+        'file_modified_time': os.path.getmtime(input_file)
+    }
     
     try:
-        with open(prefs_file, 'w') as f:
-            json.dump(prefs, f, indent=2)
+        with open(cache_file, 'wb') as f:
+            pickle.dump(cache_data, f)
+        print(f"✓ Cached normalized data")
+        return True
     except Exception as e:
-        print(f"Warning: Could not save preferences: {e}")
+        print(f"Warning: Could not save cache: {e}")
+        return False
+
+def load_from_cache():
+    """Load normalized XML from cache if it exists"""
+    cache_dir = get_cache_dir()
+    cache_file = os.path.join(cache_dir, get_cache_filename())
+    
+    if not os.path.exists(cache_file):
+        return None
+    
+    try:
+        with open(cache_file, 'rb') as f:
+            cache_data = pickle.load(f)
+        
+        print(f"✓ Found cache")
+        return cache_data
+    except Exception as e:
+        print(f"✗ Could not load cache: {e}")
+        return None
 
 def get_color_fill(color_name):
     """Get a PatternFill object for a standard color"""
@@ -263,185 +285,208 @@ def load_check_module(module_name, file_path):
         print(f"Error loading check module {module_name}: {e}")
         return None
 
+def normalize_xml(raw_xml):
+    """Normalize XML content - extracted from parse_ddr for reuse"""
+    # Replace all emojis with + BEFORE any other processing
+    raw_xml = replace_emojis_with_plus(raw_xml)
+    
+    count_nwea  = raw_xml.count("??")
+    print(f'Found {count_nwea} occurrences of "??" in raw_xml')
+
+    # Replace all double question marks (was "🤯."), this is because Filemaker DDR doesn't always export emoji's correctly and it causes parsing problems.
+    # Now this should be redundant since we're replacing all emojis, but keeping for backwards compatibility
+    raw_xml = raw_xml.replace("??", "+")
+    
+    # Check if the problematic pattern exists BEFORE any modifications
+    if DEBUG_MODE:
+        if "</DisplayCalculation>UpdateSingleStudentOnServer" in raw_xml:
+            print("[DEBUG] Found </DisplayCalculation>UpdateSingleStudentOnServer BEFORE normalization")
+        else:
+            print("[DEBUG] Did NOT find </DisplayCalculation>UpdateSingleStudentOnServer BEFORE normalization")
+    
+    # Replace smart quotes with regular quotes to normalize script references
+    # Using Unicode escapes to avoid encoding issues
+    raw_xml = raw_xml.replace("\u201C", '"')  # U+201C " Left double quotation mark
+    raw_xml = raw_xml.replace("\u201D", '"')  # U+201D " Right double quotation mark
+    raw_xml = raw_xml.replace("\u201E", '"')  # U+201E „ Double low-9 quotation mark
+    raw_xml = raw_xml.replace("\u201F", '"')  # U+201F ‟ Double high-reversed-9 quotation mark
+    raw_xml = raw_xml.replace("\u2018", "'")  # U+2018 ' Left single quotation mark
+    raw_xml = raw_xml.replace("\u2019", "'")  # U+2019 ' Right single quotation mark
+    
+    # Fix self-closing tags to ensure proper parsing
+    # Add space before /> to prevent issues with script name detection
+    raw_xml = raw_xml.replace('"/>', '" />')
+    raw_xml = raw_xml.replace("'/>", "' />")
+    
+    # Debug: Check if the problematic pattern exists
+    if DEBUG_MODE:
+        import re
+        problem_pattern = re.findall(r'</DisplayCalculation>[A-Za-z]+', raw_xml)
+        if problem_pattern:
+            print(f"[DEBUG] Found {len(problem_pattern)} instances of content directly after </DisplayCalculation>")
+            for pattern in problem_pattern[:3]:
+                print(f"[DEBUG]   Example: {pattern}")
+    
+    # Note: Not fixing the </DisplayCalculation>ScriptName pattern
+    # This unusual XML structure needs to be preserved for accurate counting
+    
+    # Also add space after semicolons in quotes for better parsing
+    raw_xml = raw_xml.replace('";', '" ;')
+    raw_xml = raw_xml.replace("';", "' ;")
+    
+    count_plus = raw_xml.count("+")
+    print(f"raw contains '+': {count_plus}")
+    
+    return raw_xml
+
+def run_checks(raw_xml, base_output_name):
+    """Run all checks - extracted from parse_ddr for reuse"""
+    # Load and run all checks from Checks folder
+    all_sheets = {}
+    sheet_orders = {}  # Track sheet orders
+    checks_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Checks")
+    
+    if os.path.exists(checks_dir):
+        print("\nRunning checks...")
+        # First, collect all check modules
+        check_modules = []
+        
+        # Scan for all .py files in Checks folder
+        for filename in sorted(os.listdir(checks_dir)):
+            if filename.endswith('.py') and not filename.startswith('__'):
+                check_path = os.path.join(checks_dir, filename)
+                module_name = filename[:-3]  # Remove .py extension
+                
+                check_module = load_check_module(module_name, check_path)
+                if check_module and hasattr(check_module, 'run_check'):
+                    # Get sheet order if defined
+                    sheet_order = None
+                    if hasattr(check_module, 'get_sheet_order'):
+                        try:
+                            sheet_order = check_module.get_sheet_order()
+                        except:
+                            sheet_order = None
+                    
+                    check_modules.append({
+                        'module': check_module,
+                        'name': module_name,
+                        'path': check_path,
+                        'order': float(sheet_order) if sheet_order is not None else float('inf')
+                    })
+        
+        # Sort modules by order, then by name
+        check_modules.sort(key=lambda x: (x['order'], x['name']))
+        
+        # Run checks in sorted order
+        total_results = 0
+        for check_info in check_modules:
+            check_module = check_info['module']
+            module_name = check_info['name']
+            
+            print(f"Running {module_name}...")
+            
+            try:
+                # Pass raw_xml to the check (with normalized quotes)
+                check_results = check_module.run_check(raw_xml)
+                if check_results and hasattr(check_module, 'get_sheet_name'):
+                    sheet_name = check_module.get_sheet_name()
+                else:
+                    # Default sheet name based on module name
+                    sheet_name = module_name.replace('_', ' ').replace('Check', '').strip()
+                
+                if check_results:
+                    all_sheets[sheet_name] = {
+                        'data': check_results,
+                        'module': check_module
+                    }
+                    sheet_orders[sheet_name] = check_info['order']
+                    total_results += len(check_results)
+                    print(f"✓ {module_name} completed with {len(check_results)} results")
+                else:
+                    print(f"  {module_name} returned no results")
+            except Exception as e:
+                print(f"Error running {module_name}: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Clear terminal before final output if not in debug mode
+        if DEBUG_MODE:
+            print("\n[DEBUG] Skipping terminal clear due to debug mode")
+            print("=== FileMaker DDR Analysis Complete (Debug Mode) ===")
+            print(f"Total issues found: {total_results}")
+            print("Debug mode: All output preserved above")
+            print()
+        else:
+            os.system('cls' if os.name == 'nt' else 'clear')
+            print("=== FileMaker DDR Analysis Complete ===")
+            print(f"Total issues found: {total_results}")
+            print()
+        
+        # Generate output with all sheets
+        if all_sheets:
+            generate_output_files(all_sheets, base_output_name, total_results, sheet_orders)
+        else:
+            print("\nNo results found from any checks.")
+    else:
+        print(f"\nChecks folder not found at: {checks_dir}")
+        print("Please create a 'Checks' folder and add check modules.")
+
 def parse_ddr(xml_file, base_output_name):
     try:
-        # --- Read & normalize XML with better encoding handling ---
-        encodings_to_try = ['utf-8', 'utf-8-sig', 'utf-16', 'utf-16le', 'utf-16be']
-        # Detect BOM-based UTF-16 and read accordingly
-        with open(xml_file, 'rb') as __f:
-            __bom = __f.read(2)
-        if __bom in (b'\xff\xfe', b'\xfe\xff'):
-            # File is UTF-16, read in one shot and skip further encoding tries
-            with open(xml_file, 'r', encoding='utf-16', errors='replace') as __f:
-                raw_xml = __f.read()
-            print("Successfully read file with utf-16 BOM detection")
+        # Check if we should use cache
+        cache_data = None
+        if CACHE_MODE:
+            cache_data = load_from_cache()
+            # Verify it's for the same file
+            if cache_data and cache_data.get('input_file') != xml_file:
+                print("✗ Cache is for a different file, ignoring cache")
+                cache_data = None
+            elif cache_data and os.path.exists(xml_file):
+                # Check if the file has been modified since caching
+                if os.path.getmtime(xml_file) != cache_data.get('file_modified_time'):
+                    print("✗ Cache invalid: source file has been modified")
+                    cache_data = None
+        
+        if cache_data:
+            # Use cached data
+            raw_xml = cache_data['normalized_xml']
+            print("✓ Using cached normalized XML")
         else:
-            raw_xml = None
-
-        if raw_xml is None:
-            for encoding in encodings_to_try:
-                try:
-                    with open(xml_file, 'r', encoding=encoding, errors='replace') as f:
-                        raw_xml = f.read()
-                    print(f"Successfully read file with {encoding} encoding")
-                    break
-                except UnicodeDecodeError:
-                    continue
-        
-        if raw_xml is None:
-            print(f"❌ Failed to read '{xml_file}' with any of the tried encodings.")
-            sys.exit(1)
-
-        # Replace all emojis with + BEFORE any other processing
-        raw_xml = replace_emojis_with_plus(raw_xml)
-        
-        count_nwea  = raw_xml.count("??")
-        print(f'Found {count_nwea} occurrences of "??" in raw_xml')
-
-        # Replace all double question marks (was "🤯."), this is because Filemaker DDR doesn't always export emoji's correctly and it causes parsing problems.
-        # Now this should be redundant since we're replacing all emojis, but keeping for backwards compatibility
-        raw_xml = raw_xml.replace("??", "+")
-        
-        # Check if the problematic pattern exists BEFORE any modifications
-        if DEBUG_MODE:
-            if "</DisplayCalculation>UpdateSingleStudentOnServer" in raw_xml:
-                print("[DEBUG] Found </DisplayCalculation>UpdateSingleStudentOnServer BEFORE normalization")
+            # --- Read & normalize XML with better encoding handling ---
+            encodings_to_try = ['utf-8', 'utf-8-sig', 'utf-16', 'utf-16le', 'utf-16be']
+            # Detect BOM-based UTF-16 and read accordingly
+            with open(xml_file, 'rb') as __f:
+                __bom = __f.read(2)
+            if __bom in (b'\xff\xfe', b'\xfe\xff'):
+                # File is UTF-16, read in one shot and skip further encoding tries
+                with open(xml_file, 'r', encoding='utf-16', errors='replace') as __f:
+                    raw_xml = __f.read()
+                print("Successfully read file with utf-16 BOM detection")
             else:
-                print("[DEBUG] Did NOT find </DisplayCalculation>UpdateSingleStudentOnServer BEFORE normalization")
-        
-        # Replace smart quotes with regular quotes to normalize script references
-        # Using Unicode escapes to avoid encoding issues
-        raw_xml = raw_xml.replace("\u201C", '"')  # U+201C " Left double quotation mark
-        raw_xml = raw_xml.replace("\u201D", '"')  # U+201D " Right double quotation mark
-        raw_xml = raw_xml.replace("\u201E", '"')  # U+201E „ Double low-9 quotation mark
-        raw_xml = raw_xml.replace("\u201F", '"')  # U+201F ‟ Double high-reversed-9 quotation mark
-        raw_xml = raw_xml.replace("\u2018", "'")  # U+2018 ' Left single quotation mark
-        raw_xml = raw_xml.replace("\u2019", "'")  # U+2019 ' Right single quotation mark
-        
-        # Fix self-closing tags to ensure proper parsing
-        # Add space before /> to prevent issues with script name detection
-        raw_xml = raw_xml.replace('"/>', '" />')
-        raw_xml = raw_xml.replace("'/>", "' />")
-        
-        # Debug: Check if the problematic pattern exists
-        if DEBUG_MODE:
-            import re
-            problem_pattern = re.findall(r'</DisplayCalculation>[A-Za-z]+', raw_xml)
-            if problem_pattern:
-                print(f"[DEBUG] Found {len(problem_pattern)} instances of content directly after </DisplayCalculation>")
-                for pattern in problem_pattern[:3]:
-                    print(f"[DEBUG]   Example: {pattern}")
-        
-        # Note: Not fixing the </DisplayCalculation>ScriptName pattern
-        # This unusual XML structure needs to be preserved for accurate counting
-        
-        # Also add space after semicolons in quotes for better parsing
-        raw_xml = raw_xml.replace('";', '" ;')
-        raw_xml = raw_xml.replace("';", "' ;")
-        
-        count_plus = raw_xml.count("+")
-        print(f"raw contains '+': {count_plus}")
-        
-        # Save the normalized XML for manual review (only in debug mode) to Exports folder
-        if DEBUG_MODE:
-            exports_dir = get_exports_dir()
-            normalized_xml_path = os.path.join(exports_dir, f"{os.path.basename(base_output_name)}_normalized.xml")
-            try:
-                with open(normalized_xml_path, 'w', encoding='utf-8') as f:
-                    f.write(raw_xml)
-                print(f"[DEBUG] Saved normalized XML to: {normalized_xml_path}")
-            except Exception as e:
-                print(f"[DEBUG] Warning: Could not save normalized XML: {e}")
+                raw_xml = None
 
-        # Load and run all checks from Checks folder
-        all_sheets = {}
-        sheet_orders = {}  # Track sheet orders
-        checks_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Checks")
-        
-        if os.path.exists(checks_dir):
-            print("\nRunning checks...")
-            # First, collect all check modules
-            check_modules = []
+            if raw_xml is None:
+                for encoding in encodings_to_try:
+                    try:
+                        with open(xml_file, 'r', encoding=encoding, errors='replace') as f:
+                            raw_xml = f.read()
+                        print(f"Successfully read file with {encoding} encoding")
+                        break
+                    except UnicodeDecodeError:
+                        continue
             
-            # Scan for all .py files in Checks folder
-            for filename in sorted(os.listdir(checks_dir)):
-                if filename.endswith('.py') and not filename.startswith('__'):
-                    check_path = os.path.join(checks_dir, filename)
-                    module_name = filename[:-3]  # Remove .py extension
-                    
-                    check_module = load_check_module(module_name, check_path)
-                    if check_module and hasattr(check_module, 'run_check'):
-                        # Get sheet order if defined
-                        sheet_order = None
-                        if hasattr(check_module, 'get_sheet_order'):
-                            try:
-                                sheet_order = check_module.get_sheet_order()
-                            except:
-                                sheet_order = None
-                        
-                        check_modules.append({
-                            'module': check_module,
-                            'name': module_name,
-                            'path': check_path,
-                            'order': float(sheet_order) if sheet_order is not None else float('inf')
-                        })
+            if raw_xml is None:
+                print(f"❌ Failed to read '{xml_file}' with any of the tried encodings.")
+                sys.exit(1)
+
+            # Normalize the XML
+            raw_xml = normalize_xml(raw_xml)
             
-            # Sort modules by order, then by name
-            check_modules.sort(key=lambda x: (x['order'], x['name']))
-            
-            # Run checks in sorted order
-            total_results = 0
-            for check_info in check_modules:
-                check_module = check_info['module']
-                module_name = check_info['name']
-                
-                print(f"Running {module_name}...")
-                
-                try:
-                    # Pass raw_xml to the check (with normalized quotes)
-                    check_results = check_module.run_check(raw_xml)
-                    if check_results and hasattr(check_module, 'get_sheet_name'):
-                        sheet_name = check_module.get_sheet_name()
-                    else:
-                        # Default sheet name based on module name
-                        sheet_name = module_name.replace('_', ' ').replace('Check', '').strip()
-                    
-                    if check_results:
-                        all_sheets[sheet_name] = {
-                            'data': check_results,
-                            'module': check_module
-                        }
-                        sheet_orders[sheet_name] = check_info['order']
-                        total_results += len(check_results)
-                        print(f"✓ {module_name} completed with {len(check_results)} results")
-                    else:
-                        print(f"  {module_name} returned no results")
-                except Exception as e:
-                    print(f"Error running {module_name}: {e}")
-                    import traceback
-                    traceback.print_exc()
-            
-            # Clear terminal before final output if not in debug mode
-            if DEBUG_MODE:
-                print("\n[DEBUG] Skipping terminal clear due to debug mode")
-                print("=== FileMaker DDR Analysis Complete (Debug Mode) ===")
-                print(f"Total issues found: {total_results}")
-                print("Debug mode: All output preserved above")
-                print()
-            else:
-                os.system('cls' if os.name == 'nt' else 'clear')
-                print("=== FileMaker DDR Analysis Complete ===")
-                print(f"Total issues found: {total_results}")
-                print()
-            
-            # Generate output with all sheets
-            if all_sheets:
-                generate_output_files(all_sheets, base_output_name, total_results, sheet_orders)
-            else:
-                print("\nNo results found from any checks.")
-        else:
-            print(f"\nChecks folder not found at: {checks_dir}")
-            print("Please create a 'Checks' folder and add check modules.")
+            # Save to cache for future runs
+            save_to_cache(raw_xml, xml_file, base_output_name)
+
+        # Run checks
+        run_checks(raw_xml, base_output_name)
 
     except ET.ParseError as e:
         print(f"Error parsing XML: {e}")
@@ -587,12 +632,6 @@ def generate_output_files(all_sheets, base_output_name, total_found, sheet_order
 
     print(f"Full report saved to: {os.path.abspath(output_path)}")
     
-    # Also mention the normalized XML if it exists (debug mode only)
-    if DEBUG_MODE:
-        normalized_xml_path = output_path.replace('_full_report.xlsx', '_normalized.xml')
-        if os.path.exists(normalized_xml_path):
-            print(f"[DEBUG] Normalized XML saved to: {os.path.abspath(normalized_xml_path)}")
-    
     print(f"\nRun complete: {total_found} results found.")
 
 def auto_open_file(filename):
@@ -612,14 +651,21 @@ def auto_open_file(filename):
         pass
 
 def get_input_file():
-    """Handle file selection with default file preferences"""
-    prefs = load_preferences()
+    """Handle file selection"""
+    # If cache mode, try to use cached data
+    if CACHE_MODE:
+        cache_data = load_from_cache()
+        if cache_data:
+            input_file = cache_data.get('input_file')
+            # Check if original file still exists
+            if input_file and os.path.exists(input_file):
+                print(f"Using cached data for: {os.path.basename(input_file)}")
+                return input_file
+            else:
+                print("✗ Original file from cache not found")
+                print("Please select the DDR file to process")
     
-    # Check if we should skip asking about default
-    skip_default_prompt = prefs.get('skip_default_prompt', False)
-    default_file = prefs.get('default_file', None)
-    
-    # Always show file picker
+    # Show file picker
     Tk().withdraw()
     input_file = askopenfilename(
         title="Select DDR XML File",
@@ -630,31 +676,16 @@ def get_input_file():
         print("No file selected. Exiting.")
         sys.exit(0)
     
-    # Handle default file preferences
-    if not skip_default_prompt:
-        # Ask if they want to make this the default
-        print(f"\nSelected file: {os.path.basename(input_file)}")
-        response = input(f"Would you like to make this your default file? (y/n): ").lower().strip()
-        
-        if response in ['y', 'yes']:
-            prefs['default_file'] = input_file
-            save_preferences(prefs)
-            print("✓ Default file saved.")
-        else:
-            # They said no, ask about future prompts
-            response2 = input("Would you like to be asked about setting a default file in the future? (y/n): ").lower().strip()
-            
-            if response2 in ['n', 'no']:
-                prefs['skip_default_prompt'] = True
-                save_preferences(prefs)
-                print("✓ You won't be asked about default files anymore.")
-            else:
-                print("✓ You'll be asked about default files in future runs.")
-    
     return input_file
 
 if __name__ == "__main__":
-    # Get input file using the new preference system
+    # Display mode information
+    if CACHE_MODE:
+        print("Cache mode enabled - will use cached data if available")
+    if DEBUG_MODE:
+        print("Debug mode enabled - additional output will be shown")
+    
+    # Get input file
     input_file = get_input_file()
     
     print(f"\nProcessing: {os.path.basename(input_file)}")
